@@ -20,7 +20,7 @@ from fastapi import Depends, FastAPI, Header, Path as FastAPIPath, Query, Reques
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DBAPIError, OperationalError
 
 from database import (
     DEFAULT_PAGE_SIZE,
@@ -195,6 +195,44 @@ async def me(current=Depends(current_agent)) -> dict[str, Any]:
     return agent_summary(current)
 
 
+RETRYABLE_SQLSTATES = {
+    "40001",  # serialization_failure
+    "40P01",  # deadlock_detected
+    "55P03",  # lock_not_available (only with NOWAIT, kept for safety)
+}
+
+
+def _is_retryable_storage_error(exc: Exception) -> bool:
+    """Should this storage error be retried instead of returned to the client?
+
+    The original check was ``"locked" in str(exc).lower()``, a substring test on
+    a message.  Two measured findings about it:
+
+    * It did accidentally catch real deadlocks.  PostgreSQL's deadlock report
+      carries ``DETAIL: Process 223 waits for ShareLock ...; blocked by process
+      222``, and ``blocked`` contains ``locked``, so the substring matched.
+      Matching by luck is still not matching by design.
+    * It genuinely missed other retryable errors.  A real ``lock_timeout`` fires
+      as sqlstate 55P03 with ``canceling statement due to lock timeout`` -- no
+      ``locked`` anywhere -- and the old predicate returned False, so the client
+      got a 500.  The same applies to 40001
+      (``could not serialize access due to concurrent update``).
+
+    So the state is read from the driver error instead of the message.  The
+    attribute name differs by driver: psycopg 3 exposes ``sqlstate``, psycopg 2
+    exposes ``pgcode``.  Reading only ``pgcode`` would silently never retry here,
+    because psycopg 3 has no such attribute (verified: ``<NO SUCH ATTR>``).
+    """
+
+    if isinstance(exc, OperationalError) and "locked" in str(exc).lower():
+        return True  # SQLite writer contention
+    if isinstance(exc, DBAPIError) and exc.orig is not None:
+        state = getattr(exc.orig, "sqlstate", None) or getattr(exc.orig, "pgcode", None)
+        if state is not None and str(state) in RETRYABLE_SQLSTATES:
+            return True
+    return False
+
+
 @app.post("/api/v1/tasks", status_code=201)
 async def tasks_create(
     body: TaskCreateRequest,
@@ -210,7 +248,7 @@ async def tasks_create(
             result = create_task(current.id, body.to, body.input, idempotency_key)
             return JSONResponse(status_code=201, content=result)
         except OperationalError as exc:
-            if retry == 2 or "locked" not in str(exc).lower():
+            if retry == 2 or not _is_retryable_storage_error(exc):
                 raise
             await asyncio.sleep(0.05 * (retry + 1))
     raise RelayError("storage_error", "The task could not be persisted.", 503)
@@ -226,7 +264,7 @@ async def claim(
         try:
             result = await asyncio.to_thread(claim_one, current.id, body.worker_id)
         except OperationalError as exc:
-            if "locked" not in str(exc).lower():
+            if not _is_retryable_storage_error(exc):
                 raise
             result = None
         if result is not None:

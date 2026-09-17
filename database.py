@@ -134,7 +134,7 @@ def _is_sqlite(url: str) -> bool:
     return url.startswith("sqlite")
 
 
-def _uses_postgres_locking(url: str) -> bool:
+def uses_row_locking(url: str) -> bool:
     """True when the backend offers row locks instead of a writer reservation.
 
     SQLite has no ``FOR UPDATE SKIP LOCKED``, so claims are serialized with
@@ -280,5 +280,6 @@ __all__ = [
     "iso_time",
     "recover_expired",
     "recover_expired_in_session",
+    "uses_row_locking",
     "utcnow",
 ]

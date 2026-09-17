@@ -18,11 +18,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database import (
     Agent,
     Attempt,
+    DATABASE_URL,
     LEASE_SECONDS,
     MAX_ATTEMPTS,
     Task,
@@ -34,6 +36,7 @@ from database import (
     recover_expired,
     recover_expired_in_session,
     utcnow,
+    uses_row_locking,
 )
 from errors import RelayError
 
@@ -103,6 +106,24 @@ def list_agents(limit: int, cursor: tuple[datetime, str] | None) -> tuple[list[A
     return rows, encode_cursor(rows[-1].created_at, rows[-1].id) if has_more and rows else None
 
 
+def _task_for_idempotency_key(db: Session, sender_id: str, idempotency_key: str) -> Task | None:
+    return db.scalar(
+        select(Task).where(Task.sender_id == sender_id, Task.idempotency_key == idempotency_key)
+    )
+
+
+def _idempotent_or_new(
+    db: Session, existing: Task, recipient_id: str, input_text: str
+) -> dict[str, str]:
+    if existing.recipient_id != recipient_id or existing.input != input_text:
+        raise RelayError(
+            "idempotency_conflict",
+            "This Idempotency-Key was already used with a different task.",
+            409,
+        )
+    return {"task_id": existing.id, "status": existing.status}
+
+
 def create_task(sender_id: str, recipient_id: str, input_text: str, idempotency_key: str | None) -> dict[str, str]:
     # Serializing task creation makes the sender-scoped idempotency check and
     # unique constraint one operation even when two API processes race.
@@ -111,17 +132,9 @@ def create_task(sender_id: str, recipient_id: str, input_text: str, idempotency_
         if recipient is None:
             raise RelayError("not_found", "Recipient agent not found.", 404)
         if idempotency_key is not None:
-            existing = db.scalar(
-                select(Task).where(Task.sender_id == sender_id, Task.idempotency_key == idempotency_key)
-            )
+            existing = _task_for_idempotency_key(db, sender_id, idempotency_key)
             if existing is not None:
-                if existing.recipient_id != recipient_id or existing.input != input_text:
-                    raise RelayError(
-                        "idempotency_conflict",
-                        "This Idempotency-Key was already used with a different task.",
-                        409,
-                    )
-                return {"task_id": existing.id, "status": existing.status}
+                return _idempotent_or_new(db, existing, recipient_id, input_text)
         task = Task(
             id=new_id("task"),
             sender_id=sender_id,
@@ -136,56 +149,124 @@ def create_task(sender_id: str, recipient_id: str, input_text: str, idempotency_
             finished_at=None,
         )
         db.add(task)
-        db.flush()
+        try:
+            db.flush()
+        except IntegrityError as exc:
+            # Only reachable on a backend without a writer reservation.  Two
+            # concurrent requests with the same key both saw no existing task,
+            # and one lost the race against uq_task_sender_idempotency.  The
+            # losing insert is a no-op, so the winner's row can be read back in
+            # a fresh session and reported as the idempotent 201 it should be
+            # instead of surfacing a 500.  On SQLite the writer reservation above
+            # makes this branch unreachable; the concurrency probe checks that.
+            db.rollback()
+            if "uq_task_sender_idempotency" not in str(exc):
+                raise
+            if idempotency_key is None:
+                raise
+            with db_session() as reader:
+                existing = _task_for_idempotency_key(reader, sender_id, idempotency_key)
+                if existing is None:
+                    raise
+                return _idempotent_or_new(reader, existing, recipient_id, input_text)
         return {"task_id": task.id, "status": task.status}
 
 
+def _claimable_task_stmt(agent_id: str, *, locking: bool):
+    """Oldest queued task for ``agent_id``, optionally with a row lock.
+
+    ``of=Task`` restricts the lock to ``tasks``.  Without it the lock would also
+    cover anything else in scope -- and :func:`claim_one` has just written
+    ``attempts`` in the same transaction on the recovery step, so locking both
+    tables would take them in the opposite order of other transactions and
+    deadlock (40P01).
+    """
+
+    stmt = (
+        select(Task)
+        .where(Task.recipient_id == agent_id, Task.status == "queued")
+        .order_by(Task.created_at, Task.id)
+        .limit(1)
+    )
+    if locking:
+        stmt = stmt.with_for_update(of=Task, skip_locked=True)
+    return stmt
+
+
+def _claim_in_session(
+    db: Session, agent_id: str, worker_id: str | None, now: datetime, *, locking: bool
+) -> dict[str, Any] | None:
+    task = db.scalar(_claimable_task_stmt(agent_id, locking=locking))
+    if task is None:
+        return None
+    if task.attempt_count >= MAX_ATTEMPTS:
+        task.status = "failed"
+        task.error = "attempts_exhausted"
+        task.finished_at = as_db_time(now)
+        return None
+
+    claim_token = new_secret("clm")
+    task.status = "processing"
+    task.attempt_count += 1
+    lease_expires = as_db_time(now + timedelta(seconds=LEASE_SECONDS))
+    db.add(
+        Attempt(
+            task_id=task.id,
+            attempt_number=task.attempt_count,
+            worker_id=worker_id,
+            claim_token_hash=secret_hash(claim_token),
+            claimed_at=as_db_time(now),
+            lease_expires_at=lease_expires,
+            finished_at=None,
+            outcome="processing",
+            terminal_action=None,
+            terminal_payload_hash=None,
+        )
+    )
+    db.flush()
+    return {
+        "task_id": task.id,
+        "from": task.sender_id,
+        "input": task.input,
+        "attempt": task.attempt_count,
+        "claim_token": claim_token,
+        "lease_expires_at": iso_time(lease_expires),
+    }
+
+
 def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
+    """Claim one queued task for its recipient, or return ``None``.
+
+    On SQLite the whole operation runs inside one ``BEGIN IMMEDIATE``
+    transaction, exactly as before: the writer reservation is what stops two API
+    processes from handing out the same task, and recovery can share the
+    transaction.
+
+    On PostgreSQL there is no writer reservation, so recovery runs in its own
+    short transaction first and the claim selects the row with
+    ``FOR UPDATE OF tasks SKIP LOCKED``.  ``of=Task`` matters: recovery has just
+    written ``attempts`` in the same session, and locking every table in scope
+    would take the two tables in the opposite order of other transactions and
+    deadlock (40P01).  ``SKIP LOCKED`` makes a contended row invisible to the
+    second claimer instead of making it wait.
+    """
+
+    if not uses_row_locking(DATABASE_URL):
+        # `now` is sampled after the writer reservation is held, exactly as the
+        # original code did.  Taking it earlier would let the clock move on while
+        # the process waits out SQLite's busy_timeout, and lease expiry would be
+        # computed from a stale "now".
+        with immediate_transaction() as db:
+            now = utcnow()
+            recover_expired_in_session(db, now)
+            return _claim_in_session(db, agent_id, worker_id, now, locking=False)
+
+    # No reservation exists here, so recovery gets its own short transaction and
+    # the claim below locks only the row it takes.
+    recover_expired()
     with immediate_transaction() as db:
         now = utcnow()
-        recover_expired_in_session(db, now)
-        task = db.scalar(
-            select(Task)
-            .where(Task.recipient_id == agent_id, Task.status == "queued")
-            .order_by(Task.created_at, Task.id)
-            .limit(1)
-        )
-        if task is None:
-            return None
-        if task.attempt_count >= MAX_ATTEMPTS:
-            task.status = "failed"
-            task.error = "attempts_exhausted"
-            task.finished_at = as_db_time(now)
-            return None
-
-        claim_token = new_secret("clm")
-        task.status = "processing"
-        task.attempt_count += 1
-        lease_expires = as_db_time(now + timedelta(seconds=LEASE_SECONDS))
-        db.add(
-            Attempt(
-                task_id=task.id,
-                attempt_number=task.attempt_count,
-                worker_id=worker_id,
-                claim_token_hash=secret_hash(claim_token),
-                claimed_at=as_db_time(now),
-                lease_expires_at=lease_expires,
-                finished_at=None,
-                outcome="processing",
-                terminal_action=None,
-                terminal_payload_hash=None,
-            )
-        )
-        db.flush()
-        return {
-            "task_id": task.id,
-            "from": task.sender_id,
-            "input": task.input,
-            "attempt": task.attempt_count,
-            "claim_token": claim_token,
-            "lease_expires_at": iso_time(lease_expires),
-        }
-
+        return _claim_in_session(db, agent_id, worker_id, now, locking=True)
 
 def _find_attempt_for_token(db: Session, task_id: str, token: str) -> Attempt | None:
     return db.scalar(
