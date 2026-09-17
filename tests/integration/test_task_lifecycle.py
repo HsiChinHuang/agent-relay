@@ -19,6 +19,22 @@ from fastapi.testclient import TestClient
 from database import DATABASE_URL
 
 
+def test_uses_scratch_database() -> None:
+    normalized = DATABASE_URL.replace("\\", "/")
+    assert "agent-relay.db" not in normalized, (
+        f"integration fixtures empty every table; refusing dev database {DATABASE_URL!r}"
+    )
+    assert "test" in normalized.lower(), (
+        f"integration fixtures need a *test* database, got {DATABASE_URL!r}"
+    )
+    if normalized.startswith("postgres"):
+        # psycopg3 only.  A bare ``postgresql://`` URL makes SQLAlchemy choose
+        # psycopg2, which is not installed, so the driver name is load-bearing.
+        assert normalized.startswith("postgresql+psycopg://"), (
+            f"PostgreSQL targets must use the psycopg3 dialect, got {DATABASE_URL!r}"
+        )
+
+
 # ---------------------------------------------------------------- helpers
 
 
