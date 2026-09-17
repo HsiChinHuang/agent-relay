@@ -17,3 +17,17 @@ dev = [
     "httpx>=0.28.1",
     "pytest>=9.1.1",
 ]
+
+# Pinned resolution window.  This key used to live only in ``uv.lock``'s
+# ``[options]`` table, passed once on the command line when the lock was first
+# generated.  uv reads configuration from the config files, so every
+# ``uv run``/``uv sync`` dropped it from the lock again ("Resolving despite
+# existing lockfile due to removal of global exclude newer").  Declaring it here
+# makes the lock and the configuration agree, so ``uv sync --frozen`` (used by
+# the Dockerfile) and plain ``uv run`` stop rewriting ``uv.lock``.
+#
+# Note: ``exclude-newer-span`` is deliberately NOT repeated here.  It is a
+# lockfile-only record; listing it makes uv fail settings discovery with
+# "unknown field `exclude-newer-span`" and discard this whole table (verified).
+[tool.uv]
+exclude-newer = "2026-09-02T14:43:46.988566751Z"
