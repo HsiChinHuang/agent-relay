@@ -64,13 +64,18 @@ jobs:
         # act images' system pip may be PEP-668 externally-managed and refuse
         # `pip install uv`, the installer works regardless. uv is then called
         # by explicit path: PATH games across act steps are not trusted.
-        # uv.lock is NEVER rewritten: --locked fails on any drift, and
-        # --frozen mirrors the Dockerfile's install.
+        # uv.lock is NEVER rewritten: --locked is the STRICTER of the pair --
+        # it verifies the lock matches pyproject and fails on drift, then
+        # installs exactly from it, dev group included (the Stage C/D recipes
+        # this step feeds need pytest). --frozen --locked were tried first:
+        # uv rejects the combination ('--frozen cannot be used with --locked')
+        # and --frozen alone would SKIP the drift verification, so --locked
+        # alone is both valid and the stronger guarantee of the two.
         run: |
           set -euo pipefail
           curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | env UV_UNMANAGED_INSTALL="$HOME/.local/bin" sh
           "$HOME/.local/bin/uv" --version | grep -q "${UV_VERSION}"
-          "$HOME/.local/bin/uv" sync --frozen --locked
+          "$HOME/.local/bin/uv" sync --locked
         env:
           UV_VERSION: 0.12.15
 
