@@ -152,6 +152,17 @@ def test_expiry_requeues_and_old_token_is_stale_before_recovery():
         assert second.json()["claim_token"] != first["claim_token"]
 
 
+def test_dashboard_heading_says_v2():
+    # The deploy gate is a TEST, not a manual curl: ci.yml's test job fails
+    # if the heading is not exactly v2, so "tests pass" now MEANS something
+    # about the heading (the Q6 workflow's second half). Both title and h1:
+    # one bumped and one stale is the inconsistency class this guards.
+    with TestClient(main.app) as client:
+        page = client.get("/")
+        assert "<title>Agent Relay v2</title>" in page.text
+        assert "<h1>Agent Relay v2</h1>" in page.text
+
+
 def test_dashboard_is_asset_and_invalid_input_is_documented_error():
     with TestClient(main.app) as client:
         page = client.get("/")

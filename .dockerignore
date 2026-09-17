@@ -29,3 +29,8 @@ agent-relay.db-wal
 
 # tests/ is intentionally NOT ignored: reusing this image as a test container
 # (docker compose run app pytest ...) is part of the Q3 acceptance story.
+
+# act scratch carrier (binaries + a COPY of the kind kubeconfig): exists only
+# during local act runs with -b, where the build context IS this checkout. Never
+# bake a kubeconfig or 70MB of CI binaries into the shipped image.
+.act-stage/

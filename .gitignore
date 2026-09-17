@@ -6,3 +6,7 @@
 __pycache__/
 .pytest_cache/
 *-credentials.json
+
+# act scratch: working dir is COPIED into the job container; the kubeconfig
+# lives here only while act runs. Never commit it -- it holds client certs.
+.act-stage/

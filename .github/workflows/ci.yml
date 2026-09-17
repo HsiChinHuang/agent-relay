@@ -1,0 +1,216 @@
+# Q6: test -> (only if green) build unique-tagged image -> deploy to kind ->
+# wait for rollout. If the test job fails, build-and-deploy NEVER STARTS:
+# the existing Deployment keeps serving the previous version untouched.
+# That structural property IS the Q6 answer ("keep the existing version
+# running and stop the deployment") -- there is no rollback step because
+# there is never a half-deploy to roll back.
+#
+# RUNNER IMAGE (review item (b)): locally this runs under act with the
+# COMMUNITY image catthehacker/ubuntu:act-24.04, pinned via -P on the act
+# command line (act's interactive picker fatals in non-tty shells). On real
+# GitHub Actions the equivalent runner is ubuntu-latest. The PostgreSQL
+# recipe below is a step, not jobs.<id>.services:, precisely so ONE recipe
+# serves both backends: act never implemented services (issue #88), while a
+# docker-run step works on hosted runners too. Job boundaries (test |
+# build-and-deploy) are unchanged, so `needs: test` semantics stay real --
+# the negative control runs this FULL workflow with no act -j flag.
+#
+# act constraints obeyed here (all measured, artifacts stage-q6-t0a/b):
+#   - job containers run network=host -> 127.0.0.1 reaches Docker-published
+#     ports of the Desktop VM (kind API 60535, the pg-ci publish below).
+#     kubeconfig server needs NO rewrite; rewriting to host.docker.internal
+#     FAILS x509 SAN validation (kind's cert names localhost/relay-control-
+#     plane only -- measured, after a CERT_NONE probe had hidden it).
+#   - $GITHUB_ENV propagation is NOT relied on (act support incomplete):
+#     KUBECONFIG is a step-level env, and uv is invoked by explicit path.
+#   - .act-stage/ (git-ignored, .dockerignored: holds a COPY of the kind
+#     kubeconfig + Linux kind/kubectl) carries those into the workspace;
+#     with act -b the workspace is this checkout itself. On GitHub the
+#     binaries come from the hosted runner instead -- the -x guards below
+#     cover both paths without pretending the second was executed here.
+#     CARRIER NAMING: the kubeconfig copy is relay-kubeconfig (NO .yaml --
+#     act YAML-SCANS the repo root as workflow candidates: .act-stage/
+#     relay-kubeconfig.yaml made act validate a kubeconfig as a workflow and
+#     die on 'Unknown Property apiVersion'; compose.test.yaml tripped the
+#     same scan. GitHub only reads .github/workflows/, so both are act-only
+#     hazards; every act run passes --workflows explicitly as the durable
+#     guard, the rename removes the mine that was in our own tree.)
+name: CI
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+env:
+  # ONE venv location for every step of the test job. Under act -b the
+  # workspace IS the host checkout, so a default .venv would be written into
+  # the host's working tree (and clash with any .venv the host put there).
+  UV_PROJECT_ENVIRONMENT: /tmp/relay-venv
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv (pinned) and project deps (locked)
+        # Pin = the version measured INSIDE the delivered image (uv 0.12.15,
+        # `docker run --rm agent-relay:v2 uv --version`), NOT an assumption:
+        # the Dockerfile installs uv floating, so CI pins the observable
+        # provenance; it also reads uv.lock revision 3. The --version grep
+        # makes the pin self-checking: if the installer ever serves a
+        # different build, the step fails HERE instead of silently drifting.
+        # Installer (astral's documented mechanism) writes to ~/.local/bin --
+        # act images' system pip may be PEP-668 externally-managed and refuse
+        # `pip install uv`, the installer works regardless. uv is then called
+        # by explicit path: PATH games across act steps are not trusted.
+        # uv.lock is NEVER rewritten: --locked fails on any drift, and
+        # --frozen mirrors the Dockerfile's install.
+        run: |
+          set -euo pipefail
+          curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | env UV_UNMANAGED_INSTALL="$HOME/.local/bin" sh
+          "$HOME/.local/bin/uv" --version | grep -q "${UV_VERSION}"
+          "$HOME/.local/bin/uv" sync --frozen --locked
+        env:
+          UV_VERSION: 0.12.15
+
+      - name: Starter tests (default SQLite backend)
+        # No RELAY_* here ON PURPOSE: the default IS the tested behavior --
+        # conftest defaults to a scratch SQLite file and the suite proves the
+        # flow there. Pinning sqlite would duplicate Stage C's matrix instead
+        # of exercising the shipped default.
+        run: |
+          set -euo pipefail
+          "$HOME/.local/bin/uv" run --no-sync python -m pytest test_agent_relay.py -q
+
+      - name: Start PostgreSQL (the services:-free recipe that runs on act AND hosted runners)
+        # Host port 5434, not 5432. Measured context (Stage A): host-side
+        # 5432 is occupied by onlinejudgedeploy-oj-postgres-1 and 5433 is
+        # relay-pg-q4's publish; under network=host the -p bind happens in
+        # THAT namespace, so a free slot must be chosen against the real
+        # namespace's occupancy. 5434 is the verified-free slot AS OF THIS
+        # MEASUREMENT -- if it is ever taken, docker run fails fast with a
+        # port-in-use error (visible, not silent); re-verify and bump.
+        # DB name contains 'test' -> testsupport's safety gate accepts it
+        # WITHOUT the RELAY_IT_ALLOW_DB=1 bypass.
+        # pg_isready forces -h: socket-only checks can pass during the
+        # initdb temp-server phase (Stage E lesson, applied twice now).
+        # The loop EXITS 1 after 30s with PG logs -- a break-on-success-only
+        # loop would let pytest run against a dead DB with fuzzy attribution.
+        run: |
+          set -euo pipefail
+          docker rm -f pg-ci 2>/dev/null || true
+          docker run -d --name pg-ci \
+            -e POSTGRES_USER=agent \
+            -e POSTGRES_PASSWORD=agent \
+            -e POSTGRES_DB=agent_relay_test \
+            -p 5434:5432 \
+            postgres:16-alpine
+          ok=0
+          for i in $(seq 1 30); do
+            if docker exec pg-ci pg_isready -h 127.0.0.1 -U agent -d agent_relay_test >/dev/null 2>&1; then
+              echo "postgres ready after ${i}s"; ok=1; break
+            fi
+            sleep 1
+          done
+          if [ "$ok" != 1 ]; then
+            echo "postgres NOT ready in 30s -- logs:"; docker logs pg-ci 2>&1 | tail -20
+            exit 1
+          fi
+
+      - name: Integration tests against PostgreSQL
+        # Backend is PINNED, not hoped for: RELAY_EXPECT_BACKEND=postgresql
+        # FAILS the run if the URL ever silently falls back to SQLite (the
+        # Stage C guard, doing its job in CI). The whole directory runs --
+        # '-k postgres' matched ZERO tests (verified before writing this;
+        # it would have exited 5 or collected nothing while looking busy).
+        # The SEEN DATABASE_URL line is the independent witness: what the
+        # process resolved, printed outside pytest's header.
+        env:
+          RELAY_DATABASE_URL: postgresql+psycopg://agent:agent@127.0.0.1:5434/agent_relay_test
+          RELAY_EXPECT_BACKEND: postgresql
+        run: |
+          set -euo pipefail
+          "$HOME/.local/bin/uv" run --no-sync python -c "import database; print('SEEN DATABASE_URL =', database.DATABASE_URL)"
+          "$HOME/.local/bin/uv" run --no-sync python -m pytest tests/integration -q
+
+      - name: Stop PostgreSQL
+        if: always()
+        run: docker rm -f pg-ci
+
+  # Repeated for grep-ability, since this file IS the Q6 answer:
+  # needs: test above == "if a test fails, keep the existing version running
+  # and stop the deployment". No build, no tag, no set image, no rollout.
+  build-and-deploy:
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve unique tag from VERSION
+        # v1/v2 exist in kind; this run lands v3. The tag lives IN git, so
+        # every deployed version is traceable from the repo. Deliberately NOT
+        # derived from git SHA: the Dockerfile's `COPY . .` means image
+        # content shifts with ANY copied file, and a SHA-based tag would hide
+        # exactly the "same SHA, different bytes" ambiguity the v1/v2 episode
+        # exposed (the README.md edit changed copied content, not the commit).
+        id: tag
+        run: echo "tag=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        run: docker build -t "agent-relay:${{ steps.tag.outputs.tag }}" .
+
+      - name: Show tag (also proves the GITHUB_OUTPUT pipe works in this act version)
+        run: |
+          echo "tag is [${{ steps.tag.outputs.tag }}]"
+          test -n "${{ steps.tag.outputs.tag }}"
+
+      - name: Load image into kind and deploy
+        env:
+          # step-level, NOT via $GITHUB_ENV: act's GITHUB_ENV propagation is
+          # incomplete (review clarification), and an explicit env per step is
+          # equally valid on GitHub. Kind's own socket path: conventional
+          # mount point (act mounts the daemon socket there by default).
+          KUBECONFIG: ${{ github.workspace }}/.act-stage/relay-kubeconfig
+          DOCKER_HOST: unix:///var/run/docker.sock
+          KIND_EXE_PATH: ${{ github.workspace }}/.act-stage/bin/kind
+        run: |
+          set -euo pipefail
+          if [ ! -x /usr/local/bin/kind ]; then
+            install -m 0755 "$KIND_EXE_PATH" /usr/local/bin/kind
+            install -m 0755 "$PWD/.act-stage/bin/kubectl" /usr/local/bin/kubectl
+          fi
+          kind version | head -1
+          kubectl version --client | head -1
+          kind get clusters
+          kind load docker-image "agent-relay:${{ steps.tag.outputs.tag }}" --name relay
+          # crictl on the NODE is the anti-silent-skip witness: 'kind load'
+          # no-ops on tags it believes are present (the v2 episode proved a
+          # missing verification here hides real staleness).
+          docker exec relay-control-plane crictl images | grep -E "agent-relay.*${{ steps.tag.outputs.tag }}"
+          kubectl set image deployment/agent-relay "agent-relay=agent-relay:${{ steps.tag.outputs.tag }}"
+          kubectl rollout status deployment/agent-relay --timeout=180s
+
+      - name: Verify deployment at CONTENT level, not just tag
+        # 'rollout finished' + template carries the tag is still label-level.
+        # Two content witnesses: (1) the RUNNING pod serves the new heading,
+        # fetched from INSIDE the pod (no port-forward dependency in CI);
+        # (2) /ready answers 200 from the same pod. -i because the program
+        # arrives on stdin (host-side shell quoting has burned this workflow
+        # repeatedly; stdin transfer is the standing convention).
+        env:
+          KUBECONFIG: ${{ github.workspace }}/.act-stage/relay-kubeconfig
+        run: |
+          set -euo pipefail
+          kubectl get deployment agent-relay -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}' | grep "agent-relay:${{ steps.tag.outputs.tag }}"
+          kubectl exec -i deploy/agent-relay -c agent-relay -- python - <<'PY'
+          import urllib.request
+          body = urllib.request.urlopen("http://127.0.0.1:8000/", timeout=10).read().decode()
+          assert "<h1>Agent Relay v2</h1>" in body, "new heading NOT serving from the pod"
+          assert urllib.request.urlopen("http://127.0.0.1:8000/ready", timeout=10).status == 200
+          print("pod serves '<h1>Agent Relay v2</h1>'; /ready 200")
+          PY
+
+  # If the test job fails, NOTHING in this file past `needs: test` executes:
+  # no image is built, no tag minted, no set image issued. The cluster keeps
+  # the previous version's pods running -- Q6 answer B as structure.
