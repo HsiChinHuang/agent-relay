@@ -134,6 +134,17 @@ def _is_sqlite(url: str) -> bool:
     return url.startswith("sqlite")
 
 
+def _uses_postgres_locking(url: str) -> bool:
+    """True when the backend offers row locks instead of a writer reservation.
+
+    SQLite has no ``FOR UPDATE SKIP LOCKED``, so claims are serialized with
+    ``BEGIN IMMEDIATE``.  PostgreSQL (and any other server backend) locks single
+    rows instead, which is what :func:`storage.claim_one` relies on.
+    """
+
+    return not _is_sqlite(url)
+
+
 engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
 if _is_sqlite(DATABASE_URL):
     engine_kwargs.update({"connect_args": {"check_same_thread": False, "timeout": 30}})
@@ -177,19 +188,28 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Run one writer transaction before selecting or changing work.
 
     SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
     ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
     terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    lease.
+
+    On PostgreSQL no statement is issued here.  The driver runs with
+    ``autocommit=False`` and SQLAlchemy autobegins, so the transaction boundary
+    already exists (verified against a live server: ``xact_start`` is non-null on
+    ``pg_stat_activity`` after the first statement).  Sending a redundant
+    ``BEGIN`` is accepted but PostgreSQL writes
+    ``WARNING: there is already a transaction in progress`` to its server log on
+    every request, so the boundary is left to the driver.  Row-level locking is
+    added per statement where it matters -- see :func:`storage.claim_one`.
     """
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if _is_sqlite(DATABASE_URL):
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
         yield session
         session.flush()
         connection.commit()
