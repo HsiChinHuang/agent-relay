@@ -1,0 +1,31 @@
+# compose.test.yaml -- test-time override, applied on top of compose.yaml:
+#
+#   docker compose -p relay-q4 -f compose.yaml -f compose.test.yaml up --build -d
+#
+# Only the published HOST port changes: 8000 -> 8083, so the test stack cannot
+# collide with the developer's own `uvicorn main:app --port 8000` (the README's
+# quickstart, Q1/Q2) or with the Q3 container's 8081.  The container still
+# listens on 8000 internally -- nothing observable about the application changes.
+#
+# WHY `!override` IS LOAD-BEARING -- read before "simplifying" it away:
+# Compose MERGES list values element-wise across -f files, so a second file that
+# merely lists a port ADDS a mapping instead of replacing one.  Verified with
+# compose v5.5.1: without the tag the merged config publishes BOTH "8000" and
+# "8083", which would defeat the whole point (the collision it exists to avoid
+# would still happen).  `!reset null` alone removes the base value but then
+# leaves the service with no published port at all, so it cannot be combined with
+# an added entry in the same sequence either (verified: `!reset null` followed by
+# a port still publishes 8000).  `!override` is the tag that means "this sequence
+# replaces the base one", and the merged config then shows 8083 only.
+#
+# This file deliberately contains NOTHING else.  In particular the test database
+# is NOT specified here: the repository-root conftest refuses a PostgreSQL target
+# whose name lacks "test", and the right answer to that is a one-off
+# RELAY_DATABASE_URL=...@postgres:5432/agent_relay_test on the command line (a
+# second database on this same server), not a permanent override and not a
+# RELAY_IT_ALLOW_DB=1 bypass.  Keeping this file to a single port mapping is what
+# lets the delivered compose.yaml stay byte-identical to the assignment spec.
+services:
+  app:
+    ports: !override
+      - "8083:8000"

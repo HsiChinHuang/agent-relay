@@ -1,0 +1,78 @@
+# Agent Relay -- application + PostgreSQL (homework Q4, Stage E).
+#
+# Same user flow as every earlier stage (register -> submit -> claim -> complete
+# -> completed), now with PostgreSQL on a named volume instead of a file.  The
+# SQLite branch is NOT removed: leaving RELAY_DATABASE_URL unset still selects
+# sqlite:///./agent-relay.db (database.py), and Stage G re-verifies that path in
+# the Q3 container on 8081.
+#
+# DESIGN RED LINE (from Q4 Stage D):
+# - FOR UPDATE is the safety mechanism (prevents concurrent reads of the same queued task)
+# - SKIP LOCKED is a throughput optimization (avoids waiting on lock contention)
+# - uq_attempt_task_number is the final safety net
+# Removing ANY of the three breaks the delivery guarantees. Do not remove.
+# Stage D measured this instead of assuming it: removing only SKIP LOCKED while
+# keeping FOR UPDATE produced zero collisions at N=8 and N=16, while removing
+# FOR UPDATE produced them in every run (2/2/5 at N=8, 9/8/11/8 at N=16) with the
+# unique constraint still preventing the double assignment.  See
+# ../hw3-verify-artifacts/stage-d-conclusion.txt.
+#
+# KNOWN LIMITATION, recorded so it is not mistaken for an oversight (P2):
+# heartbeat(), commit_terminal() and authenticate() take no explicit row lock.
+# All three are single-row UPDATEs, which PostgreSQL locks automatically, so the
+# worst realistic outcome is contention or a lost update on one row -- not a
+# double-complete.  Left as-is deliberately; the row-lock treatment is applied
+# only to claim_one(), where two transactions can read the *same* queued row.
+# Revisit only with a test that can show the difference (Stage D could not).
+#
+# PORTS -- read before copying anything from Stage A:
+# PostgreSQL is reached *inside* this compose network on its standard 5432.  Host
+# port 5433 exists only in Stage A's throwaway container, because this machine
+# already runs onlinejudgedeploy-oj-postgres-1 (postgres:10-alpine) on 5432.
+# Compose, the K8s manifests (Q5) and CI (Q6) must NOT copy 5433: inside a
+# compose network, a cluster network or a CI runner there is nothing to avoid,
+# and carrying 5433 forward would wrongly suggest it is part of the protocol.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: agent          # local/dev credentials, same as Stage A's
+      POSTGRES_DB: agent_relay          # throwaway stack; do not reuse elsewhere
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1 is deliberate, not decoration: pg_isready with no -h dials the
+      # unix socket (/var/run/postgresql:5432), while the image's initdb temporary
+      # server listens ONLY on that socket (listen_addresses='').  A socket probe can
+      # therefore go healthy during initialisation, before the real server is
+      # reachable over TCP at all.  Forcing TCP makes the initialisation-phase server
+      # fail the probe, so `service_healthy` means "the server the app will actually
+      # connect to is up".  Measured: see Q4-PLAN.md, Stage E race analysis.
+      # retries: 10 x interval: 5s = a 50s tolerance window; no start_period needed.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U agent -d agent_relay"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"     # spec value; compose.test.yaml maps the host side to 8083
+    environment:
+      RELAY_DATABASE_URL: postgresql+psycopg://agent:agent@postgres:5432/agent_relay
+      # postgresql+psycopg:// is load-bearing: a bare postgresql:// makes
+      # SQLAlchemy pick psycopg2, which is not a dependency (psycopg[binary] v3 is).
+      # No enrollment secret is set, so POST /api/v1/agents is open by design
+      # (main.py only enforces one when RELAY_ENROLLMENT_SECRET is present); the
+      # flow's Bearer tokens are the agt_... values that call returns.
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Deliberately "no": if the app crashes because PostgreSQL was not really
+    # ready, a crash log is the evidence and a restart policy would hide it.
+    restart: "no"
+
+volumes:
+  pgdata:
