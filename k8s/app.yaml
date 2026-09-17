@@ -1,0 +1,134 @@
+# ---------------------------------------------------------------------------
+# Agent Relay app on kind.
+#
+# The Deployment is the Q5 answer made manifest: it keeps spec.replicas pods
+# alive and performs rolling updates on image changes -- that is what Q6's
+# "rollout must finish" waits on.
+#
+# DESIGN RED LINE (from Stage D, carried per plan): the claim path's safety is
+# FOR UPDATE + uq_attempt_task_number, with SKIP LOCKED as a throughput
+# optimization. Raising replicas below multiplies claim contention -- which is
+# exactly the regime Stage D measured -- so anyone editing replicas should read
+# the Stage D conclusion first. Removing any of the three breaks the delivery
+# guarantees; none of it lives in this file.
+#
+# Image tag: the :vNNN-style unique tag is written by the deployment step
+# (Q6 requires a unique tag per version; kubectl set image / a render script
+# supplies it). The placeholder below is what `kubectl apply -f k8s/app.yaml`
+# alone would run -- and apply on a placeholder fails LOUDLY at pull time,
+# which is the desired failure mode versus a silently stale :latest.
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-relay
+  labels:
+    app: agent-relay
+spec:
+  replicas: 2                # >1 on purpose: Q5 asks what keeps replicas up,
+                             # and two pods sharing one PostgreSQL is the real
+                             # multi-worker shape the row-lock code is for.
+                             # (Not "resilience theater": with one pod a
+                             # deleted pod just goes away for a few seconds.)
+  selector:
+    matchLabels:
+      app: agent-relay
+  template:
+    metadata:
+      labels:
+        app: agent-relay
+    spec:
+      initContainers:
+        # K8s has no depends_on: condition: service_healthy (Stage E's compose
+        # gate). The first deploy WITHOUT this proved why one is needed: both
+        # app pods crash-looped (exit 1, restartCount 2 and 3) with
+        # psycopg.OperationalError against the postgres Service ClusterIP --
+        # init_db() runs at import/startup and dies if PG is not accepting
+        # TCP yet. The Deployment eventually self-heals (that is the Q5 answer
+        # at work), but a cold start with 2-3 restarts per pod is the wrong
+        # shape, and Q6's rollout would inherit it.
+        # This is the compose healthcheck ported verbatim, same lesson twice:
+        # pg_isready MUST force TCP with -h <host>. Left to the unix socket,
+        # the image's initdb temp server (socket-only) answers healthy before
+        # any TCP listener exists -- Stage E proved that on the same image.
+        - name: wait-for-postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until pg_isready -h postgres -p 5432 -U agent -d agent_relay; do
+                echo "postgres not accepting TCP yet"; sleep 2;
+              done
+      containers:
+        - name: agent-relay
+          image: agent-relay:v1    # replaced per version; see header
+          imagePullPolicy: IfNotPresent   # kind load docker-image leaves no
+                                          # registry provenance; Always would
+                                          # try to pull a local-only name and
+                                          # fail. This is the flag the Q6
+                                          # "unique tag per version" rule
+                                          # interacts with: a NEW tag always
+                                          # resolves fresh, so IfNotPresent is
+                                          # safe there too.
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            # $(VAR) expansion resolves only against variables declared EARLIER
+            # in this list, so the Secret reference must come first. The first
+            # draft of this file had them the other way around -- the URL would
+            # have carried the literal string $(POSTGRES_PASSWORD) as the
+            # password and connection failures would have looked like a DB
+            # problem, not an env-order problem. Verified the right way after
+            # deploy: printenv inside the running pod shows the expanded URL.
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-auth
+                  key: POSTGRES_PASSWORD
+            - name: RELAY_DATABASE_URL
+              value: postgresql+psycopg://agent:$(POSTGRES_PASSWORD)@postgres:5432/agent_relay
+          readinessProbe:
+            # /ready issues a SELECT 1 against the real engines (verified in
+            # main.py), so "ready" means "database actually answers" rather
+            # than "process exists". That is what depends_on: service_healthy
+            # was for in compose, re-expressed as a probe.
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-relay
+  labels:
+    app: agent-relay
+spec:
+  selector:
+    app: agent-relay
+  ports:
+    - port: 8000
+      targetPort: http
+      name: http
+  # ClusterIP (the default): port-forwarding reaches it directly; a NodePort
+  # would add a host-port lottery for no benefit in this exercise.

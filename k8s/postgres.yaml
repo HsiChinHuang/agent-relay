@@ -1,0 +1,153 @@
+# ---------------------------------------------------------------------------
+# PostgreSQL for Agent Relay, on kind.
+#
+# WHY A Deployment AND NOT A STATEFULSET (the trade-off the assignment accepts):
+#   Q5's teachable resource is the Deployment -- it is the answer to "which
+#   resource keeps the replica count and manages updates".  A Deployment plus a
+#   single ReadWriteOnce PVC satisfies the "persistent DB storage" requirement:
+#   the PVC outlives pod deletions and the Deployment re-creates the pod onto
+#   the same claim.  Production would use a StatefulSet here (stable pod
+#   identity, ordered rollouts, per-replica volume claims); with a Deployment
+#   the pod name changes on every restart and there is exactly one replica,
+#   which is fine for one node and one writer, and is the concession recorded
+#   in k8s/README.md.
+#
+# Consequences of that choice, made explicit in the spec below rather than left
+# implicit:
+#   * strategy: Recreate -- a Deployment's default RollingUpdate would briefly
+#     run TWO pods against one ReadWriteOnce volume while the old one drains;
+#     two writers to one PostgreSQL data directory is corruption, not rolling.
+#   * replicas: 1, enforced by the single RWO PVC.
+#
+# DESIGN RED LINE carried from Stage D (do not "simplify" away): the app's
+# claim path keeps FOR UPDATE (safety), SKIP LOCKED (throughput) and
+# uq_attempt_task_number (final safety net).  None of them is a manifest
+# concern, but scaling app replicas below or raising them changes contention,
+# and this file pair is what Q6 reuses -- so the reminder lives where someone
+# editing replicas will actually see it.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-auth
+  labels:
+    app.kubernetes.io/part-of: agent-relay
+type: Opaque
+stringData:
+  # The password is not a secret worth hiding on a local kind cluster, but a
+  # Secret is the right SHAPE: the app's DATABASE_URL references it by key and
+  # nothing sensitive lands in the app Deployment's env block or in git beyond
+  # this throwaway value.
+  POSTGRES_PASSWORD: relay-k8s-pass
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  labels:
+    app.kubernetes.io/part-of: agent-relay
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # storageClassName omitted on purpose: kind ships a default StorageClass
+  # (standard) and pinning the name would make this file kind-specific for no
+  # benefit. Verified present: `kubectl get storageclass` shows one marked
+  # (default).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  labels:
+    app: postgres
+    app.kubernetes.io/part-of: agent-relay
+spec:
+  replicas: 1                # one writer; see the Recreate note above
+  strategy:
+    type: Recreate           # never two pods sharing the RWO PVC
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine    # same image family as compose.yaml;
+                                       # kind's nodes are linux/amd64 like the
+                                       # local daemon, so no cross-arch caveat
+          imagePullPolicy: IfNotPresent
+          args: ["-c", "listen_addresses=*"]   # the image default already
+                                               # listens everywhere; explicit
+                                               # for the reader, harmless
+          ports:
+            - containerPort: 5432
+              name: postgres
+          env:
+            - name: POSTGRES_DB
+              value: agent_relay
+            - name: POSTGRES_USER
+              value: agent
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-auth
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata   # subdir so lost+found
+                                                       # never breaks initdb
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            # REQUIRED by the assignment ("readiness checks"). Same shape as
+            # the compose healthcheck, including -h 127.0.0.1: pg_isready over
+            # the unix socket can go true during the initdb temp server (which
+            # listens on the socket only), while TCP is not up yet. TCP here
+            # means "ready" means "the app can actually connect".
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pg_isready -h 127.0.0.1 -U agent -d agent_relay
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 10
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pg_isready -h 127.0.0.1 -U agent -d agent_relay
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app: postgres
+    app.kubernetes.io/part-of: agent-relay
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+      name: postgres
+      # 5432 in-cluster, per the Q5 convention: inside the cluster there is no
+      # host-port collision logic at all (5432/5433 on the host are irrelevant
+      # here; nothing is NodePort/LoadBalancer).
