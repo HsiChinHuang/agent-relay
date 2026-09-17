@@ -1,0 +1,31 @@
+# Local virtualenv: the image syncs its own environment from uv.lock.
+.venv
+
+# Bytecode and caches.
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Local SQLite state: never bake a database into image layers.  (The container
+# uses a named volume mounted at /data instead.)
+agent-relay.db
+agent-relay.db-shm
+agent-relay.db-wal
+*.db
+*.db-shm
+*.db-wal
+
+# Worker credential files recommended by the README: never bake secrets in.
+*-credentials.json
+
+# Version control metadata.
+.git
+
+# Pins uv to Python 3.11; the base image already provides 3.12 and the lock is
+# universal (see the Dockerfile comment).  Excluding it avoids uv downloading a
+# second interpreter at build time.
+.python-version
+
+# tests/ is intentionally NOT ignored: reusing this image as a test container
+# (docker compose run app pytest ...) is part of the Q3 acceptance story.
