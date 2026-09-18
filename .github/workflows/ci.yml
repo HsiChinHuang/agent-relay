@@ -35,6 +35,20 @@
 #     same scan. GitHub only reads .github/workflows/, so both are act-only
 #     hazards; every act run passes --workflows explicitly as the durable
 #     guard, the rename removes the mine that was in our own tree.)
+#   - .act-stage/ carrier is GONE from the deploy path: run #1 on real GitHub
+#     Actions proved why -- .act-stage is git-ignored, so a hosted runner's
+#     checkout has no such directory and the install died (the '--x guards
+#     cover both paths' claim in the first revision was overreach: a branch
+#     that never executed on GH cannot claim coverage). THE ONE RECIPE NOW:
+#     deploy always downloads checksum-pinned kind/kubectl (aee61515.../8efbb943...
+#     -- the same sums recorded in t0a, the local carrier re-verified against
+#     them before pinning), then finds-or-creates the 'relay' cluster: act
+#     exports the existing cluster's kubeconfig (network=host reaches the
+#     published 127.0.0.1 port); a hosted runner creates an EPHEMERAL kind
+#     cluster from the SAME pinned node image (kindest/node:v1.34.11@sha256:
+#     44e222ee...) and applies k8s/ manifests (app.yaml rendered to the
+#     VERSION tag; image loaded BEFORE apply so IfNotPresent never pulls a
+#     local-only name). No branch relies on files that exist on only one backend.
 name: CI
 on:
   workflow_dispatch:
@@ -46,12 +60,17 @@ env:
   # workspace IS the host checkout, so a default .venv would be written into
   # the host's working tree (and clash with any .venv the host put there).
   UV_PROJECT_ENVIRONMENT: /tmp/relay-venv
+  # Reviewer-mandated: pre-empt the Node.js runner migration. checkout@v5
+  # declares node24 already (v4.2.0 STILL declares node20 -- measured against
+  # action.yml, which is why the bump is v5, not v4.2.0); the flag covers any
+  # remaining node20-era JS actions on runners that honour it.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install uv (pinned) and project deps (locked)
         # Pin = the version measured INSIDE the delivered image (uv 0.12.15,
@@ -150,10 +169,10 @@ jobs:
     needs: test
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Resolve unique tag from VERSION
-        # v1/v2 exist in kind; this run lands v3. The tag lives IN git, so
+        # The tag lives IN git, so every deployed version is traceable
         # every deployed version is traceable from the repo. Deliberately NOT
         # derived from git SHA: the Dockerfile's `COPY . .` means image
         # content shifts with ANY copied file, and a SHA-based tag would hide
@@ -170,31 +189,87 @@ jobs:
           echo "tag is [${{ steps.tag.outputs.tag }}]"
           test -n "${{ steps.tag.outputs.tag }}"
 
-      - name: Load image into kind and deploy
-        env:
-          # step-level, NOT via $GITHUB_ENV: act's GITHUB_ENV propagation is
-          # incomplete (review clarification), and an explicit env per step is
-          # equally valid on GitHub. Kind's own socket path: conventional
-          # mount point (act mounts the daemon socket there by default).
-          KUBECONFIG: ${{ github.workspace }}/.act-stage/relay-kubeconfig
-          DOCKER_HOST: unix:///var/run/docker.sock
-          KIND_EXE_PATH: ${{ github.workspace }}/.act-stage/bin/kind
+      - name: Provision pinned toolchain (kind + kubectl, checksum-verified)
+        # WHY THIS EXISTS: GitHub run #1 died right here -- the first revision
+        # installed kind/kubectl from .act-stage/, which is GIT-IGNORED, so a
+        # hosted runner's checkout has no such directory (the '--x guards
+        # cover both paths' line in that revision was an overreach: a branch
+        # never executed on GitHub cannot claim coverage). Downloading with
+        # published checksums works identically on act and hosted runners --
+        # and the sums are the SAME ones the local carrier verified against
+        # (stage-q6-t0a), carrier re-checked before pinning.
+        # Installed under $HOME, invoked by EXPLICIT PATH: /usr/local/bin
+        # writability differs between act (root) and hosted runners, and PATH
+        # / $GITHUB_ENV propagation across act steps is not trusted. $HOME
+        # survives across steps of one job on both backends.
         run: |
           set -euo pipefail
-          if [ ! -x /usr/local/bin/kind ]; then
-            install -m 0755 "$KIND_EXE_PATH" /usr/local/bin/kind
-            install -m 0755 "$PWD/.act-stage/bin/kubectl" /usr/local/bin/kubectl
+          mkdir -p "$HOME/relay-ci"
+          curl -fsSL -o "$HOME/relay-ci/kind" https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          echo "aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  $HOME/relay-ci/kind" | sha256sum -c -
+          curl -fsSL -o "$HOME/relay-ci/kubectl" https://dl.k8s.io/release/v1.34.11/bin/linux/amd64/kubectl
+          echo "8efbb9435132a190920eb65a47a8c1ecf755ad85ab57a600c9bedbab460bb7a8  $HOME/relay-ci/kubectl" | sha256sum -c -
+          chmod +x "$HOME/relay-ci/kind" "$HOME/relay-ci/kubectl"
+          "$HOME/relay-ci/kind" --version | head -1
+          "$HOME/relay-ci/kubectl" version --client | head -1
+
+      - name: Find-or-create the kind cluster, load the image, deploy
+        # ONE recipe, two backends, branch PRINTED into the log:
+        #   existing cluster named 'relay' (the local act path -- Desktop VM,
+        #     network=host reaches its published 127.0.0.1:60535; T0 probe 4
+        #     measured that kind sees this cluster through the socket)
+        #     -> load, set image, rollout. THIS path is what run #1 reached
+        #     locally; it stayed green through the T1/T2/T3 episodes.
+        #   no 'relay' cluster (GitHub hosted runner) -> create one EPHEMERALLY
+        #     from the SAME digest-pinned node image kind v0.33.0 shipped for
+        #     v1.34.11 (never :latest), apply k8s/ manifests with the image
+        #     rendered to the VERSION tag, load the image BEFORE the app apply
+        #     so IfNotPresent never has to pull a local-only name.
+        #     HONESTY FLAG: this ephemeral branch is NEW CODE as of this
+        #     commit -- run #1 died before any cluster logic, so nothing here
+        #     had ever executed on GitHub until this push's run says so.
+        # --kubeconfig FLAGS everywhere on kubectl, not the env var: step-level
+        #   env propagation in act has already been distrusted by design.
+        #   kind is the EXCEPTION because it MUSTN'T take one: `kind load
+        #   docker-image --kubeconfig` is 'unknown flag' (v0.33.0 --help has no
+        #   such flag; act run proved it, and the T0-era 'kind delete takes
+        #   --kubeconfig' memory was about a DIFFERENT subcommand). kind reads
+        #   $KUBECONFIG, so the export below is load-bearing for kind and the
+        #   flags for kubectl -- both spellings, each where it actually works.
+        env:
+          DOCKER_HOST: unix:///var/run/docker.sock
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          KIND="$HOME/relay-ci/kind"; KCTL="$HOME/relay-ci/kubectl"; KC="$HOME/relay-ci/kubeconfig"
+          export KUBECONFIG="$KC"
+          $KIND get clusters || true
+          if $KIND get clusters 2>/dev/null | grep -qx relay; then
+            echo "BACKEND=existing-cluster (act against the Desktop VM's relay)"
+            $KIND get kubeconfig --name relay > "$KC"
+            $KIND load docker-image "agent-relay:$TAG" --name relay
+            docker exec relay-control-plane crictl images | grep -E "agent-relay.*$TAG"   # anti-silent-skip
+            "$KCTL" --kubeconfig "$KC" set image deployment/agent-relay "agent-relay=agent-relay:$TAG"
+            "$KCTL" --kubeconfig "$KC" rollout status deployment/agent-relay --timeout=180s
+          else
+            echo "BACKEND=ephemeral-cluster (hosted runner: nothing to keep; the Q6 keep-the-old-version gate still lives in needs:)"
+            $KIND create cluster --name relay --image kindest/node:v1.34.11@sha256:44e222ee2132dab25ff87301682f89eb82c7880ea3a1bf543bfe9708fd08d67d --kubeconfig "$KC" --wait 120s
+            $KIND load docker-image "agent-relay:$TAG" --name relay
+            docker exec relay-control-plane crictl images | grep -E "agent-relay.*$TAG"
+            "$KCTL" --kubeconfig "$KC" apply -f k8s/postgres.yaml
+            "$KCTL" --kubeconfig "$KC" rollout status deployment/postgres --timeout=300s
+            sed -E "s|image: agent-relay:v[0-9]+|image: agent-relay:$TAG|" k8s/app.yaml > "$HOME/relay-ci/app.rendered.yaml"
+            grep "image: agent-relay:" "$HOME/relay-ci/app.rendered.yaml"
+            "$KCTL" --kubeconfig "$KC" apply -f "$HOME/relay-ci/app.rendered.yaml"
+            "$KCTL" --kubeconfig "$KC" rollout status deployment/agent-relay --timeout=300s
           fi
-          kind version | head -1
-          kubectl version --client | head -1
-          kind get clusters
-          kind load docker-image "agent-relay:${{ steps.tag.outputs.tag }}" --name relay
-          # crictl on the NODE is the anti-silent-skip witness: 'kind load'
-          # no-ops on tags it believes are present (the v2 episode proved a
-          # missing verification here hides real staleness).
-          docker exec relay-control-plane crictl images | grep -E "agent-relay.*${{ steps.tag.outputs.tag }}"
-          kubectl set image deployment/agent-relay "agent-relay=agent-relay:${{ steps.tag.outputs.tag }}"
-          kubectl rollout status deployment/agent-relay --timeout=180s
+        # NOTE on tag uniqueness: VERSION-in-git keeps tags unique per VERSION,
+        # but identical tags across runs are only identical IMAGES while the
+        # base layers (python:3.12-slim etc.) hold still -- upstream base drift
+        # makes same-tag-different-bytes possible over time. Accepted for this
+        # assignment (the v1/v2 lesson was about LOCAL staleness, which the
+        # crictl witness above covers); pinning base digests is the production
+        # fix, noted rather than quietly skipped.
 
       - name: Verify deployment at CONTENT level, not just tag
         # 'rollout finished' + template carries the tag is still label-level.
@@ -203,12 +278,11 @@ jobs:
         # (2) /ready answers 200 from the same pod. -i because the program
         # arrives on stdin (host-side shell quoting has burned this workflow
         # repeatedly; stdin transfer is the standing convention).
-        env:
-          KUBECONFIG: ${{ github.workspace }}/.act-stage/relay-kubeconfig
         run: |
           set -euo pipefail
-          kubectl get deployment agent-relay -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}' | grep "agent-relay:${{ steps.tag.outputs.tag }}"
-          kubectl exec -i deploy/agent-relay -c agent-relay -- python - <<'PY'
+          KC="$HOME/relay-ci/kubeconfig"; KCTL="$HOME/relay-ci/kubectl"
+          "$KCTL" --kubeconfig "$KC" get deployment agent-relay -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}' | grep "agent-relay:${{ steps.tag.outputs.tag }}"
+          "$KCTL" --kubeconfig "$KC" exec -i deploy/agent-relay -c agent-relay -- python - <<'PY'
           import urllib.request
           body = urllib.request.urlopen("http://127.0.0.1:8000/", timeout=10).read().decode()
           assert "<h1>Agent Relay v2</h1>" in body, "new heading NOT serving from the pod"
